@@ -1,0 +1,68 @@
+from typing import List
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+from ..llm import get_llm
+from ..config import AgentConfig
+from ..state import AnalysisStep
+
+class AnalysisPlan(BaseModel):
+    steps: List[AnalysisStep] = Field(description="List of analysis steps to perform")
+
+class QueryDecomposer:
+    def __init__(self, config: AgentConfig):
+        self.llm = get_llm(config.model)
+    
+    def decompose(self, query: str, context: str = "") -> List[AnalysisStep]:
+        """
+        Decomposes a user query into specific analysis steps.
+        Now includes 'context' (schema info) to help the planner make better decisions.
+        """
+        from langchain_core.output_parsers import JsonOutputParser
+        
+        parser = JsonOutputParser(pydantic_object=AnalysisPlan)
+        
+        system_prompt = """You are a senior data analyst. Your goal is to create a step-by-step execution plan to answer the user's business question.
+        
+        Capabilities:
+        - You have access to multiple data sources (SQL, Vector, Files).
+        - You can execute SQL queries.
+        - You can perform final synthesis.
+        
+        Available Tools:
+        - sql: Generate and execute a SQL query.
+        - python: (Not yet implemented, generally avoid unless necessary).
+        
+        Rules:
+        - Break down complex "compare" questions into separate data retrieval steps.
+        - Ensure steps are logical and sequential. Assign unique IDs to steps.
+        - If a step requires the result of a previous step (e.g. "Compare X and Y" needs "Get X"), set 'dependency' to the ID of that previous step.
+        - Use the provided schema context to infer feasibility (e.g. if table exists).
+        - IMPORTANT: For each step, identify the correct 'datasource' from the schema context provided. If unsure, use 'default'.
+        
+        Output Format:
+        Return a valid JSON object with a single key 'steps' containing a list of step objects.
+        Each step object must have: id, description, tool, datasource, dependency, thought.
+        """
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("user", "Schema Context:\n{context}\n\nUser Question: {query}\n\n{format_instructions}")
+        ])
+        
+        chain = prompt | self.llm | parser
+        
+        # Retry logic could be added here, but for now we rely on the parser
+        try:
+            result = chain.invoke({
+                "query": query, 
+                "context": context,
+                "format_instructions": parser.get_format_instructions()
+            })
+            # Result is a dict, likely {'steps': [...]}
+            # Validate with Pydantic
+            plan = AnalysisPlan(**result)
+            return plan.steps
+        except Exception as e:
+            # Fallback or simple re-raise
+            print(f"Decomposition Error: {e}")
+            return []
