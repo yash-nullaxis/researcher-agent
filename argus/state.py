@@ -28,3 +28,5 @@ class AnalysisState(TypedDict):
     step_results: Annotated[List[StepResult], operator.add]
     final_memo: str
     errors: Annotated[List[str], operator.add]
+    retry_count: int  # Tracking attempts for current step
+    last_error: Optional[str]  # Feedback for error correction

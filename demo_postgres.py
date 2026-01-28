@@ -49,7 +49,7 @@ async def main():
 
     # 4. Run Analysis
     # A generic query that works on any schema
-    query = "List all tables in the database and give me a summary of the first table found."
+    query = "commpare the block time vs actual time of indigo and ix"
     
     print(f"\n--- Running Postgres Verification with Gemini 2.0 Flash ---\nQuery: {query}")
     result = await agent.run(query)

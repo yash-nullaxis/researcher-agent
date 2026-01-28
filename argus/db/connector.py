@@ -11,8 +11,8 @@ class DBConnector(ABC):
         pass
     
     @abstractmethod
-    def execute_query(self, query: str) -> List[Dict[str, Any]]:
-        """Execute a query and return results as a list of dicts."""
+    def get_schema_dict(self) -> Dict[str, List[str]]:
+        """Return schema as a mapping of table names to column lists."""
         pass
 
 class SqlAlchemyConnector(DBConnector):
@@ -24,33 +24,75 @@ class SqlAlchemyConnector(DBConnector):
         schema_info = []
         for table_name in inspector.get_table_names():
             columns = inspector.get_columns(table_name)
-            # Format: name (type)
-            col_strs = [f"{c['name']} ({c['type']})" for c in columns]
+            col_names = [c['name'] for c in columns]
             
-            # Samples (Assuming generic SQL support)
-            samples_str = ""
-            row_count = "Unknown"
+            # Profiling logic
+            row_count = 0
+            null_counts = {}
+            top_values = {}
+            
             try:
                 with self.engine.connect() as conn:
-                    # Row Count
-                    count_res = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
-                    row_count = count_res.scalar()
+                    # 1. Total Row Count and Null Counts in one pass
+                    # Construct: SELECT COUNT(*), COUNT(col1), COUNT(col2) ...
+                    agg_cols = [text("COUNT(*) as total_rows")]
+                    for col in col_names:
+                        # Use quoted name for safety
+                        agg_cols.append(text(f'COUNT("{col}") as "count_{col}"'))
+                    
+                    agg_query = text(f'SELECT {", ".join([str(c) for c in agg_cols])} FROM "{table_name}"')
+                    agg_res = conn.execute(agg_query).mappings().first()
+                    
+                    row_count = agg_res["total_rows"]
+                    for col in col_names:
+                        non_null = agg_res[f"count_{col}"]
+                        null_counts[col] = row_count - non_null
 
-                    # Samples
-                    res = conn.execute(text(f"SELECT * FROM {table_name} LIMIT 3"))
+                    # 2. Top Values for each column (limited to a few samples to stay efficient)
+                    # We only do this for columns that aren't obviously unique IDs or very long text if possible, 
+                    # but for now we do it for all up to a limit.
+                    for col in col_names:
+                        try:
+                            top_query = text(f'SELECT "{col}" as val, COUNT(*) as cnt FROM "{table_name}" WHERE "{col}" IS NOT NULL GROUP BY "{col}" ORDER BY cnt DESC LIMIT 3')
+                            top_res = conn.execute(top_query).mappings().all()
+                            top_values[col] = [f"{r['val']} ({r['cnt']})" for r in top_res]
+                        except Exception:
+                            top_values[col] = ["Error profile"]
+
+            except Exception as e:
+                return f"Error profiling table {table_name}: {e}"
+
+            # Format Output
+            col_strs = []
+            for c in columns:
+                name = c['name']
+                null_pct = (null_counts.get(name, 0) / row_count * 100) if row_count > 0 else 0
+                top_vals_str = ", ".join(top_values.get(name, []))
+                col_strs.append(f"  - {name} ({c['type']}) | Nulls: {null_pct:.1f}% | Top: [{top_vals_str}]")
+            
+            # Sample Rows
+            samples_str = "[]"
+            try:
+                with self.engine.connect() as conn:
+                    res = conn.execute(text(f'SELECT * FROM "{table_name}" LIMIT 3'))
                     samples = [dict(row) for row in res.mappings()]
                     samples_str = str(samples)
-            except Exception as e:
-                samples_str = f"No samples ({e})"
-                if row_count == "Unknown":
-                    row_count = f"Error: {e}"
+            except Exception: pass
 
-            schema_info.append(f"Table: {table_name}\nRows: {row_count}\nColumns: {', '.join(col_strs)}\nSamples: {samples_str}")
+            schema_info.append(f"Table: {table_name}\nRows: {row_count}\nColumns:\n" + "\n".join(col_strs) + f"\nSummary Samples: {samples_str}")
         return "\n\n".join(schema_info)
+
+    def get_schema_dict(self) -> Dict[str, List[str]]:
+        inspector = inspect(self.engine)
+        schema = {}
+        for table_name in inspector.get_table_names():
+            schema[table_name] = [c['name'] for c in inspector.get_columns(table_name)]
+        return schema
 
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
         from ..safety import SQLValidator
-        is_valid, error = SQLValidator().validate(query)
+        schema = self.get_schema_dict()
+        is_valid, error = SQLValidator().validate(query, schema_info=schema)
         if not is_valid:
             raise ValueError(f"Safety Check Failed: {error}")
 
@@ -84,31 +126,71 @@ class DuckDBConnector(DBConnector):
         
         schema_info = []
         for table_name in table_names:
-            columns = self.conn.execute(f"DESCRIBE {table_name}").fetchall()
-            col_strs = [f"{c[0]} ({c[1]})" for c in columns]
+            columns = self.conn.execute(f'DESCRIBE "{table_name}"').fetchall()
+            col_names = [c[0] for c in columns]
             
-            # Samples & Stats
-            samples_str = ""
-            row_count = "Unknown"
+            # Profiling Logic
+            row_count = 0
+            null_counts = {}
+            top_values = {}
+            
             try:
-                # Row Count
-                row_count = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                # 1. Row Count and Nulls
+                agg_list = ["COUNT(*)"]
+                for col in col_names:
+                    agg_list.append(f'COUNT("{col}")')
+                
+                agg_res = self.conn.execute(f'SELECT {", ".join(agg_list)} FROM "{table_name}"').fetchone()
+                row_count = agg_res[0]
+                for i, col in enumerate(col_names):
+                    non_null = agg_res[i+1]
+                    null_counts[col] = row_count - non_null
+                
+                # 2. Top Values
+                for col in col_names:
+                    try:
+                        top_res = self.conn.execute(f'SELECT "{col}" as val, COUNT(*) as cnt FROM "{table_name}" WHERE "{col}" IS NOT NULL GROUP BY "{col}" ORDER BY cnt DESC LIMIT 3').fetchall()
+                        top_values[col] = [f"{r[0]} ({r[1]})" for r in top_res]
+                    except Exception:
+                        top_values[col] = ["Error"]
+            except Exception as e:
+                 return f"Error profiling DuckDB table {table_name}: {e}"
 
-                # Samples
-                sample_rows = self.conn.execute(f"SELECT * FROM {table_name} LIMIT 3").fetchall()
+            # Format Column Strings
+            col_strs = []
+            for i, col_data in enumerate(columns):
+                name = col_data[0]
+                dtype = col_data[1]
+                null_pct = (null_counts.get(name, 0) / row_count * 100) if row_count > 0 else 0
+                top_vals_str = ", ".join(top_values.get(name, []))
+                col_strs.append(f"  - {name} ({dtype}) | Nulls: {null_pct:.1f}% | Top: [{top_vals_str}]")
+
+            # Samples
+            samples_str = "[]"
+            try:
+                sample_rows = self.conn.execute(f'SELECT * FROM "{table_name}" LIMIT 3').fetchall()
                 sample_cols = [desc[0] for desc in self.conn.description]
                 samples = [dict(zip(sample_cols, row)) for row in sample_rows]
                 samples_str = str(samples)
-            except Exception:
-                samples_str = "No samples."
+            except Exception: pass
 
-            schema_info.append(f"Table: {table_name}\nRows: {row_count}\nColumns: {', '.join(col_strs)}\nSamples: {samples_str}")
+            schema_info.append(f"Table: {table_name}\nRows: {row_count}\nColumns:\n" + "\n".join(col_strs) + f"\nSummary Samples: {samples_str}")
         
         return "\n\n".join(schema_info)
 
+    def get_schema_dict(self) -> Dict[str, List[str]]:
+        tables = self.conn.execute("SHOW TABLES").fetchall()
+        schema = {}
+        for t in tables:
+            t_name = t[0]
+            cols = self.conn.execute(f'DESCRIBE "{t_name}"').fetchall()
+            schema[t_name] = [c[0] for c in cols]
+        return schema
+
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
         from ..safety import SQLValidator
-        is_valid, error = SQLValidator().validate(query, dialect="duckdb")
+        schema = self.get_schema_dict()
+        is_valid, error = SQLValidator().validate(query, dialect="duckdb", schema_info=schema)
         if not is_valid:
             raise ValueError(f"Safety Check Failed: {error}")
 

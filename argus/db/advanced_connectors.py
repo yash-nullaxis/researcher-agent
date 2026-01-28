@@ -9,6 +9,9 @@ class NoSQLConnector(DBConnector):
     def get_schema_info(self) -> str:
         # Default behavior: generic description
         return "NoSQL Database. Dynamic Schema."
+    
+    def get_schema_dict(self) -> Dict[str, List[str]]:
+        return {}
         
 class MongoDBConnector(NoSQLConnector):
     def __init__(self, connection_str: str, database: str):
@@ -21,17 +24,31 @@ class MongoDBConnector(NoSQLConnector):
         # List collections and get one sample from each to infer structure
         schema_parts = []
         for collection_name in self.db.list_collection_names():
+            count = self.db[collection_name].count_documents({})
             # Get one document to sample structure
             sample = self.db[collection_name].find_one()
             if sample:
                 # Convert ObjectId to str for display
+                sample['_id'] = str(sample['_id'])
                 sample_str = str(sample)
+                fields = list(sample.keys())
             else:
                 sample_str = "Empty Collection"
+                fields = []
             
-            schema_parts.append(f"Collection: {collection_name}\nSample Document: {sample_str}")
+            schema_parts.append(f"Collection: {collection_name}\nDocs: {count}\nFields (Sampled): {', '.join(fields)}\nSample Document: {sample_str}")
             
         return "\n\n".join(schema_parts)
+
+    def get_schema_dict(self) -> Dict[str, List[str]]:
+        schema = {}
+        for collection_name in self.db.list_collection_names():
+            sample = self.db[collection_name].find_one()
+            if sample:
+                schema[collection_name] = [str(k) for k in sample.keys()]
+            else:
+                schema[collection_name] = []
+        return schema
 
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
         # Expects query to be a JSON string like: {"collection": "users", "filter": {"age": {"$gt": 25}}}
@@ -79,6 +96,9 @@ class ChromaDBConnector(DBConnector):
         count = self.collection.count()
         sample = self.collection.peek(limit=1)
         return f"Vector Collection: {self.collection_name}\nCount: {count}\nSample: {sample}"
+
+    def get_schema_dict(self) -> Dict[str, List[str]]:
+        return {self.collection_name: ["id", "content", "metadata"]}
 
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
         # Query here implies semantic search string

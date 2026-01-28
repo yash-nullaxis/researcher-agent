@@ -104,83 +104,76 @@ class Orchestrator:
 
     def analyst_node(self, state: AnalysisState):
         current_idx = state['current_step_index']
-        # Safety check
         if current_idx >= len(state['plan']):
             return {} 
             
         step = state['plan'][current_idx]
-        
-        # Determine Connector
         target_source = step.datasource or self.default_source
         if target_source not in self.connectors:
-             # Fallback if LLM halluncinated source name
              target_source = self.default_source
              
-        # Switch Executor's DB
-        # Ideally, we should instantiate a fresh executor or have executor accept db in execute()
-        # For now, we swap the db in the existing instance (a bit hacky but works for sequential)
         self.executor.db = self.connectors[target_source]
         
-        # Execute Step
-        # Execute Step
         if step.tool == 'sql':
             schema_context = state['context_data']['schema']
             
+            # Check if we've already failed this step too many times
+            if state.get('last_error') and state.get('retry_count', 0) >= 3:
+                if self.config.verbose:
+                    print(f"[Analyst] Max retries reached for step {step.id}")
+                return {
+                    "step_results": [StepResult(step_id=step.id, success=False, error=state['last_error'], output=None)],
+                    "current_step_index": current_idx + 1,
+                    "last_error": None,
+                    "retry_count": 0
+                }
+
             if self.config.verbose:
-                print(f"\n[Analyst] Step ID: {step.id}")
-                print(f"[Analyst] Goal: {step.description}")
-                print(f"[Analyst] Datasource: {target_source}")
-                print(f"[Analyst] Schema Context Length: {len(schema_context)}")
+                print(f"\n[Analyst] Step ID: {step.id} (Attempt {state.get('retry_count', 0) + 1})")
                 
-            # Generate
-            query = self.sql_gen.generate_sql(step.description, schema_context)
+            # Generate with Error Context if present
+            query = self.sql_gen.generate_sql(
+                step.description, 
+                schema_context, 
+                error_context=state.get('last_error')
+            )
             
             if self.config.verbose:
                 print(f"[Analyst] Generated SQL: {query}")
             
-            # Validate
-            # If target is Vector/NoSQL, validation might differ. 
-            # DuckDB/SQLAlchemy support SQLValidator. 
-            # Vector/NoSQL connectors might need bypass or custom validation.
-            if isinstance(self.executor.db, (SqlAlchemyConnector, type(None))): # DuckDB inherits DBConnector but checking instance is better
-                 # Logic: We should rely on connector's own safety checks or global validator?
-                 # Global validator parses SQL. If Vector DB uses natural language "query", SQLValidator fails.
-                 # Let's Skip SQL Validation if not a SQL connector?
-                 # Or better: SQLValidator defaults to SQL dialect.
-                 pass
-
-            # Execute
             try:
                 result = self.executor.execute(query)
                 
-                if self.config.verbose:
-                    print(f"[Analyst] Raw Result: {result}")
-                
                 # Check Relevance
-                rel = self.relevance_checker.check_relevance(query, step.description, str(result)[:1000]) # truncated
+                rel = self.relevance_checker.check_relevance(query, step.description, str(result)[:1000])
                 
                 if not rel.is_relevant or rel.score < 5:
+                    error_msg = f"Low relevance: {rel.reasoning}"
                     return {
-                        "step_results": [StepResult(step_id=step.id, output=result, success=False, error=f"Low relevance: {rel.reasoning}", query_executed=query)],
-                        "current_step_index": current_idx + 1
+                        "last_error": error_msg,
+                        "retry_count": state.get('retry_count', 0) + 1
                     }
                 
+                # Success
                 return {
                     "step_results": [StepResult(step_id=step.id, output=result, success=True, query_executed=query)],
-                    "current_step_index": current_idx + 1
+                    "current_step_index": current_idx + 1,
+                    "last_error": None,
+                    "retry_count": 0
                 }
             except Exception as e:
                 if self.config.verbose:
-                    print(f"[Analyst] Error executing SQL: {e}")
+                    print(f"[Analyst] Execution Error: {e}")
                 return {
-                    "step_results": [StepResult(step_id=step.id, output=None, success=False, error=str(e), query_executed=query)],
-                    "current_step_index": current_idx + 1
+                    "last_error": str(e),
+                    "retry_count": state.get('retry_count', 0) + 1
                 }
         else:
-            # Placeholder for other tools or fallback
             return {
                 "step_results": [StepResult(step_id=step.id, output="Skipped non-SQL step", success=False)],
-                "current_step_index": current_idx + 1
+                "current_step_index": current_idx + 1,
+                "last_error": None,
+                "retry_count": 0
             }
 
     def synthesizer_node(self, state: AnalysisState):
@@ -188,6 +181,10 @@ class Orchestrator:
         return {"final_memo": memo}
 
     def should_continue(self, state: AnalysisState):
+        # Auto-Repair Cycle
+        if state.get('last_error'):
+             return "analyst"
+
         if state['current_step_index'] < len(state['plan']):
             return "analyst"
         return "synthesizer"
@@ -199,8 +196,10 @@ class Orchestrator:
         initial_state = {
             "user_query": query, 
             "step_results": [],
-            "errors": []
+            "errors": [],
+            "current_step_index": 0,
+            "retry_count": 0,
+            "last_error": None,
+            "context_data": {}
         }
-        # invoke is sync or async? Compiled graph supports both.
-        # But we made this method async.
         return await self.graph.ainvoke(initial_state)

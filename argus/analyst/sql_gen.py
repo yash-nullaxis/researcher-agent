@@ -11,7 +11,7 @@ class SQLSynthesizer:
     def __init__(self, config: AgentConfig):
         self.llm = get_llm(config.model)
     
-    def generate_sql(self, goal: str, schema_context: str, dialect: str = "duckdb") -> str:
+    def generate_sql(self, goal: str, schema_context: str, dialect: str = "duckdb", error_context: str = None) -> str:
         from langchain_core.output_parsers import JsonOutputParser
         
         parser = JsonOutputParser(pydantic_object=SQLQuery)
@@ -28,6 +28,9 @@ class SQLSynthesizer:
           - "explanation": Brief explanation.
         """
         
+        if error_context:
+            system_prompt += f"\n\nCRITICAL: Your previous attempt failed with this error: {{error_context}}. Please analyze the error and fix your SQL logic or syntax accordingly."
+        
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
             ("user", "Schema:\n{schema}\n\nGoal: {goal}\n\n{format_instructions}")
@@ -38,7 +41,8 @@ class SQLSynthesizer:
             result = chain.invoke({
                 "schema": schema_context, 
                 "goal": goal,
-                "format_instructions": parser.get_format_instructions()
+                "format_instructions": parser.get_format_instructions(),
+                "error_context": error_context or ""
             })
             # Handle potential casing issues or extra keys
             return result.get('query') or result.get('sql') or ""
