@@ -26,8 +26,9 @@ async def main():
             api_key=SecretStr(api_key)
         ),
         # This DSN is passed here but also used explicitly in connector below
-        db_connection_str="postgresql://postgres:0h5UPFxhRWUFwdwE@localhost:5432/postgres", 
-        verbose=args.verbose
+        db_connection_str="postgresql://postgres:0h5UPFxhRWUFwdwE@localhost:5432/postgres",
+        verbose=args.verbose,
+        log_sql=True,
     )
 
     # 2. Setup Data Connector for Postgres
@@ -49,7 +50,9 @@ async def main():
 
     # 4. Run Analysis
     # A generic query that works on any schema
-    query = "commpare the block time vs actual time of indigo and ix"
+    query = """
+    Show me the total number of flights for each month in 2025.
+    """
     
     print(f"\n--- Running Postgres Verification with Gemini 2.0 Flash ---\nQuery: {query}")
     result = await agent.run(query)

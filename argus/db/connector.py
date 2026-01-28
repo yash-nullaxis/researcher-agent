@@ -1,19 +1,28 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
 import sqlalchemy
-from sqlalchemy import create_engine, text, inspect
-from contextlib import contextmanager
+from sqlalchemy import create_engine, inspect, text
+
+from ..safety import SQLValidator
+
 
 class DBConnector(ABC):
     @abstractmethod
     def get_schema_info(self) -> str:
         """Return schema information as a string."""
-        pass
-    
+        raise NotImplementedError
+
     @abstractmethod
     def get_schema_dict(self) -> Dict[str, List[str]]:
         """Return schema as a mapping of table names to column lists."""
-        pass
+        raise NotImplementedError
+
+    @abstractmethod
+    def execute_query(self, query: str) -> List[Dict[str, Any]]:
+        """Execute a query and return list-of-dict results."""
+        raise NotImplementedError
+
 
 class SqlAlchemyConnector(DBConnector):
     def __init__(self, connection_str: str):
@@ -90,11 +99,13 @@ class SqlAlchemyConnector(DBConnector):
         return schema
 
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
-        from ..safety import SQLValidator
+        """
+        Execute a read-only SQL query with safety validation.
+        """
         schema = self.get_schema_dict()
         is_valid, error = SQLValidator().validate(query, schema_info=schema)
         if not is_valid:
-            raise ValueError(f"Safety Check Failed: {error}")
+            raise ValueError(f"SafetyError: {error}")
 
         with self.engine.connect() as conn:
             result = conn.execute(text(query))
@@ -188,11 +199,15 @@ class DuckDBConnector(DBConnector):
         return schema
 
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
-        from ..safety import SQLValidator
+        """
+        Execute a read-only DuckDB query with safety validation.
+        """
         schema = self.get_schema_dict()
-        is_valid, error = SQLValidator().validate(query, dialect="duckdb", schema_info=schema)
+        is_valid, error = SQLValidator().validate(
+            query, dialect="duckdb", schema_info=schema
+        )
         if not is_valid:
-            raise ValueError(f"Safety Check Failed: {error}")
+            raise ValueError(f"SafetyError: {error}")
 
         # DuckDB returns list of tuples or we can convert to arrow/pandas/dict
         # Using fetchall() and description to make dicts

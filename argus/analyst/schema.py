@@ -1,15 +1,22 @@
-from ..db.connector import DBConnector
 from typing import Dict, Optional
+
 import uuid
 
+from ..db.connector import DBConnector
+
+
 class SchemaInspector:
-    def __init__(self, db: DBConnector | Dict[str, DBConnector], vector_store: Optional[DBConnector] = None):
+    def __init__(
+        self,
+        db: DBConnector | Dict[str, DBConnector],
+        vector_store: Optional[DBConnector] = None,
+    ):
         self.db = db
         self.vector_store = vector_store
-        
+
         # Trigger indexing if RAG is enabled
         if self.vector_store:
-             self._index_schemas()
+            self._index_schemas()
 
     def get_summary(self, query: str = None) -> str:
         """
@@ -25,18 +32,21 @@ class SchemaInspector:
                 # ChromaDBConnector returns list of dicts with 'content' and 'metadata'
                 results = self.vector_store.execute_query(query)
                 if results:
-                     context_parts = []
-                     for r in results:
-                         content = r.get('content', '')
-                         meta = r.get('metadata', {})
-                         context_parts.append(f"{content}\n(Metadata: {meta})")
-                     
-                     if context_parts:
-                        return "--- RELEVANT TABLES (RAG FILTERED) ---\n" + "\n\n".join(context_parts)
+                    context_parts = []
+                    for r in results:
+                        content = r.get("content", "")
+                        meta = r.get("metadata", {})
+                        context_parts.append(f"{content}\n(Metadata: {meta})")
+
+                    if context_parts:
+                        return (
+                            "--- RELEVANT TABLES (RAG FILTERED) ---\n"
+                            + "\n\n".join(context_parts)
+                        )
             except Exception as e:
-                 # Fallback to full summary on error
-                 return f"{full_summary}\n(RAG Error: {e})"
-        
+                # Fallback to full summary on error
+                return f"{full_summary}\n(RAG Error: {e})"
+
         return full_summary
 
     def _index_schemas(self):
@@ -46,50 +56,100 @@ class SchemaInspector:
         """
         try:
             full_text = self._get_global_summary()
-            
-            # Simple Heuristic Chunking: Split by "Table:" or "Collection:"
-            # A better way would be for Connectors to return structured metadata, but we work with text for now.
+
+            # Split on explicit 'Table:' / 'Collection:' boundaries when present.
             chunks = []
             metadatas = []
             ids = []
-            
-            # Split by double newline which usually separates tables in our format
-            raw_sections = full_text.split("\n\n")
-            
+
+            raw_sections = []
+            current = []
+            for line in full_text.splitlines():
+                if line.startswith("Table: ") or line.startswith("Collection: "):
+                    if current:
+                        raw_sections.append("\n".join(current))
+                        current = []
+                current.append(line)
+            if current:
+                raw_sections.append("\n".join(current))
+
+            if not raw_sections:
+                raw_sections = full_text.split("\n\n")
+
             for section in raw_sections:
-                if not section.strip(): continue
-                
+                if not section.strip():
+                    continue
+
                 # Metadata extraction
                 source = "unknown"
+                table = None
                 if "--- SOURCE:" in section:
                     try:
-                        source = section.split("SOURCE:")[1].split("---")[0].strip()
-                    except: pass
-                
+                        source = (
+                            section.split("SOURCE:")[1].split("---")[0].strip()
+                        )
+                    except Exception:
+                        pass
+
+                for line in section.splitlines():
+                    if line.startswith("Table: "):
+                        table = line.replace("Table: ", "").strip()
+                        break
+                    if line.startswith("Collection: "):
+                        table = line.replace("Collection: ", "").strip()
+                        break
+
                 chunks.append(section)
-                metadatas.append({"source": source, "type": "schema_summary"})
+                metadatas.append(
+                    {
+                        "source": source,
+                        "table": table,
+                        "type": "schema_summary",
+                    }
+                )
                 ids.append(str(uuid.uuid4()))
-            
+
             # Upsert to Vector Store
-            if hasattr(self.vector_store, 'add_documents'):
-                self.vector_store.add_documents(documents=chunks, metadatas=metadatas, ids=ids)
-                
+            if hasattr(self.vector_store, "add_documents"):
+                self.vector_store.add_documents(
+                    documents=chunks, metadatas=metadatas, ids=ids
+                )
+
         except Exception as e:
             print(f"Warning: Failed to index schemas for RAG: {e}")
 
     def _get_global_summary(self) -> str:
         """
-        Aggregates schema info from all connectors.
+        Aggregates schema info from all connectors, including a short structured header.
         """
         if isinstance(self.db, dict):
             # Multi-source mode
             global_summary = []
             for name, connector in self.db.items():
                 try:
+                    schema_dict = connector.get_schema_dict()
+                    header_lines = []
+                    for table_name, cols in schema_dict.items():
+                        preview_cols = ", ".join(cols[:5])
+                        header_lines.append(
+                            f"- {table_name}: {preview_cols}"
+                        )
+                    header = "Tables:\n" + "\n".join(header_lines) if header_lines else "Tables: (none detected)"
+
                     schema = connector.get_schema_info()
-                    global_summary.append(f"--- SOURCE: {name} ---\n{schema}")
+                    global_summary.append(
+                        f"--- SOURCE: {name} ---\n{header}\n\n{schema}"
+                    )
                 except Exception as e:
-                    global_summary.append(f"--- SOURCE: {name} ---\nError fetching schema: {e}")
+                    global_summary.append(
+                        f"--- SOURCE: {name} ---\nError fetching schema: {e}"
+                    )
             return "\n\n".join(global_summary)
         else:
-            return self.db.get_schema_info()
+            schema_dict = self.db.get_schema_dict()
+            header_lines = []
+            for table_name, cols in schema_dict.items():
+                preview_cols = ", ".join(cols[:5])
+                header_lines.append(f"- {table_name}: {preview_cols}")
+            header = "Tables:\n" + "\n".join(header_lines) if header_lines else "Tables: (none detected)"
+            return f"{header}\n\n{self.db.get_schema_info()}"

@@ -1,18 +1,26 @@
-from typing import Optional, Dict
-from langgraph.graph import StateGraph, END
-from .state import AnalysisState, StepResult, AnalysisStep
-from .config import AgentConfig
-from .db.connector import SqlAlchemyConnector, DBConnector
-from .analyst.schema import SchemaInspector
+from typing import Dict, Optional
+
+from langgraph.graph import END, StateGraph
+
 from .analyst.decomposer import QueryDecomposer
-from .analyst.sql_gen import SQLSynthesizer
-from .safety import SQLValidator
 from .analyst.executor import SQLExecutor
 from .analyst.relevance import RelevanceChecker
+from .analyst.schema import SchemaInspector
+from .analyst.sql_gen import SQLSynthesizer
+from .config import AgentConfig
+from .db.connector import DBConnector, DuckDBConnector, SqlAlchemyConnector
+from .safety import SQLValidator
+from .state import AnalysisState, AnalysisStep, StepResult
 from .synthesizer.memo import Synthesizer
 
+
 class Orchestrator:
-    def __init__(self, config: AgentConfig, connector: Optional[DBConnector] = None, connectors: Optional[Dict[str, DBConnector]] = None):
+    def __init__(
+        self,
+        config: AgentConfig,
+        connector: Optional[DBConnector] = None,
+        connectors: Optional[Dict[str, DBConnector]] = None,
+    ):
         self.config = config
         
         # Initialize Services
@@ -76,104 +84,258 @@ class Orchestrator:
         
         return workflow.compile()
 
+    def _infer_sqlglot_dialect(self, connector: DBConnector) -> str:
+        """
+        Infer a sqlglot-compatible dialect name for the active connector.
+
+        This is used both to:
+        - steer SQL generation (LLM prompt)
+        - validate/parse SQL locally before execution
+        """
+        # DuckDB connector is explicit
+        if isinstance(connector, DuckDBConnector):
+            return "duckdb"
+
+        # SQLAlchemy engines expose a dialect name (e.g. 'postgresql', 'duckdb', 'sqlite')
+        engine = getattr(connector, "engine", None)
+        dialect_name = None
+        try:
+            if engine is not None and hasattr(engine, "dialect"):
+                dialect_name = getattr(engine.dialect, "name", None)
+        except Exception:
+            dialect_name = None
+
+        if not dialect_name:
+            return "duckdb"
+
+        # Map SQLAlchemy dialect names to sqlglot names
+        if dialect_name in ("postgresql", "postgres"):
+            return "postgres"
+        if dialect_name == "duckdb":
+            return "duckdb"
+        if dialect_name in ("sqlite",):
+            return "sqlite"
+
+        # Best-effort fallback
+        return str(dialect_name)
+
     def planner_node(self, state: AnalysisState):
         if self.config.verbose:
             print("\n[Planner] Fetching Schema Summary...")
             
-        schema_summary = self.inspector.get_summary(query=state['user_query'])
+        schema_summary = self.inspector.get_summary(query=state["user_query"])
+        # Structured schema for validators / planner hints
+        schema_dict = {}
+        try:
+            # Single connector vs multi‑source dict
+            if isinstance(self.connectors, dict):
+                for name, conn in self.connectors.items():
+                    try:
+                        schema_dict[name] = conn.get_schema_dict()
+                    except Exception:
+                        schema_dict[name] = {}
+            else:
+                schema_dict = {"default": self.connectors.get_schema_dict()}  # type: ignore[union-attr]
+        except Exception:
+            schema_dict = {}
         
         if self.config.verbose:
             print(f"[Planner] Schema Summary:\n{schema_summary}")
         
         # Decompose
-        steps = self.decomposer.decompose(state['user_query'], context=schema_summary)
+        datasource_list = list(self.connectors.keys())
+        steps = self.decomposer.decompose(
+            state["user_query"],
+            context=schema_summary,
+            datasources=self.config.datasource_hints or {
+                name: "" for name in datasource_list
+            },
+        )
+
+        if not steps:
+            # Fallback to a single default SQL step so the agent remains usable.
+            steps = [
+                AnalysisStep(
+                    id=1,
+                    description=state["user_query"],
+                    tool="sql",
+                    datasource=self.default_source,
+                    dependency=-1,
+                    thought="Fallback single-step plan because planner returned no steps.",
+                )
+            ]
         
         if self.config.verbose:
             print(f"\n[Planner] Generated Plan: {len(steps)} steps")
             for s in steps:
                 print(f"  - [{s.id}] {s.description} (Source: {s.datasource})")
                 
+        debug_msgs = [
+            "[Planner] Completed planning.",
+            f"[Planner] Sources: {list(self.connectors.keys())}",
+        ]
+
         return {
-            "plan": steps, 
-            "context_data": {"schema": schema_summary},
+            "plan": steps,
+            "context_data": {"schema": schema_summary, "schema_dict": schema_dict},
             "current_step_index": 0,
-            # Initialize lists (reducers will append if we passed list, but here we init)
-            # Actually, because we use operator.add, we must act carefully
-            # But the first node can return the initial expected keys if not present
+            "debug_trace": debug_msgs,
         }
 
     def analyst_node(self, state: AnalysisState):
-        current_idx = state['current_step_index']
-        if current_idx >= len(state['plan']):
+        current_idx = state["current_step_index"]
+        if current_idx >= len(state["plan"]):
             return {} 
             
-        step = state['plan'][current_idx]
+        step = state["plan"][current_idx]
         target_source = step.datasource or self.default_source
         if target_source not in self.connectors:
              target_source = self.default_source
              
         self.executor.db = self.connectors[target_source]
         
-        if step.tool == 'sql':
-            schema_context = state['context_data']['schema']
-            
+        if step.tool == "sql":
+            schema_context = state["context_data"].get("schema", "")
+            schema_dict = state["context_data"].get("schema_dict", {})
+
             # Check if we've already failed this step too many times
-            if state.get('last_error') and state.get('retry_count', 0) >= 3:
+            if state.get("last_error") and state.get(
+                "retry_count", 0
+            ) >= self.config.max_retry_per_step:
                 if self.config.verbose:
                     print(f"[Analyst] Max retries reached for step {step.id}")
                 return {
-                    "step_results": [StepResult(step_id=step.id, success=False, error=state['last_error'], output=None)],
+                    "step_results": [
+                        StepResult(
+                            step_id=step.id,
+                            success=False,
+                            error=state["last_error"],
+                            output=None,
+                        )
+                    ],
                     "current_step_index": current_idx + 1,
                     "last_error": None,
-                    "retry_count": 0
+                    "retry_count": 0,
+                    "debug_trace": [
+                        f"[Analyst] Max retries reached for step {step.id}: {state.get('last_error')}"
+                    ],
                 }
 
             if self.config.verbose:
-                print(f"\n[Analyst] Step ID: {step.id} (Attempt {state.get('retry_count', 0) + 1})")
+                print(
+                    f"\n[Analyst] Step ID: {step.id} (Attempt {state.get('retry_count', 0) + 1})"  # type: ignore[arg-type]
+                )
                 
             # Generate with Error Context if present
+            dialect = self._infer_sqlglot_dialect(self.connectors[target_source])
             query = self.sql_gen.generate_sql(
                 step.description, 
-                schema_context, 
-                error_context=state.get('last_error')
+                schema_context,
+                dialect=dialect,
+                error_context=state.get("last_error"),
             )
             
             if self.config.verbose:
                 print(f"[Analyst] Generated SQL: {query}")
+
+            debug_msgs = [f"[Analyst] Step {step.id} SQL: {query}"]
+
+            # Fast local validation before hitting the DB
+            connector = self.connectors[target_source]
+            try:
+                connector_schema = (
+                    connector.get_schema_dict()
+                    if hasattr(connector, "get_schema_dict")
+                    else {}
+                )
+            except Exception:
+                connector_schema = {}
+
+            # Choose dialect based on connector type/engine
+            dialect = self._infer_sqlglot_dialect(connector)
+            is_valid, error_msg = self.validator.validate(
+                query, dialect=dialect, schema_info=connector_schema
+            )
+            if not is_valid:
+                if self.config.verbose:
+                    print(f"[Analyst] Local validation failed: {error_msg}")
+                debug_msgs.append(
+                    f"[Analyst] Validation failed for step {step.id}: {error_msg}"
+                )
+                return {
+                    "last_error": error_msg,
+                    "retry_count": state.get("retry_count", 0) + 1,
+                    "debug_trace": debug_msgs,
+                }
             
             try:
                 result = self.executor.execute(query)
                 
                 # Check Relevance
-                rel = self.relevance_checker.check_relevance(query, step.description, str(result)[:1000])
+                rel = self.relevance_checker.check_relevance(
+                    query, step.description, str(result)[:1000]
+                )
                 
-                if not rel.is_relevant or rel.score < 5:
+                if not rel.is_relevant or rel.score < self.config.min_relevance_score:
                     error_msg = f"Low relevance: {rel.reasoning}"
+                    debug_msgs.append(
+                        f"[Analyst] Low relevance for step {step.id}: {error_msg}"
+                    )
                     return {
                         "last_error": error_msg,
-                        "retry_count": state.get('retry_count', 0) + 1
+                        "retry_count": state.get("retry_count", 0) + 1,
+                        "debug_trace": debug_msgs,
                     }
-                
+
+                # Basic per-step metrics
+                row_count = len(result) if isinstance(result, list) else None
+                columns = list(result[0].keys()) if row_count and row_count > 0 else None
+
                 # Success
                 return {
-                    "step_results": [StepResult(step_id=step.id, output=result, success=True, query_executed=query)],
+                    "step_results": [
+                        StepResult(
+                            step_id=step.id,
+                            output=result,
+                            success=True,
+                            query_executed=query,
+                            row_count=row_count,
+                            columns=columns,
+                        )
+                    ],
                     "current_step_index": current_idx + 1,
                     "last_error": None,
-                    "retry_count": 0
+                    "retry_count": 0,
+                    "total_iterations": state.get("total_iterations", 0) + 1,
+                    "debug_trace": debug_msgs,
                 }
             except Exception as e:
                 if self.config.verbose:
                     print(f"[Analyst] Execution Error: {e}")
                 return {
                     "last_error": str(e),
-                    "retry_count": state.get('retry_count', 0) + 1
+                    "retry_count": state.get("retry_count", 0) + 1,
+                    "total_iterations": state.get("total_iterations", 0) + 1,
+                    "debug_trace": [
+                        f"[Analyst] Execution error for step {step.id}: {e}"
+                    ],
                 }
         else:
             return {
-                "step_results": [StepResult(step_id=step.id, output="Skipped non-SQL step", success=False)],
+                "step_results": [
+                    StepResult(
+                        step_id=step.id,
+                        output="Skipped non-SQL step",
+                        success=False,
+                    )
+                ],
                 "current_step_index": current_idx + 1,
                 "last_error": None,
-                "retry_count": 0
+                "retry_count": 0,
+                "total_iterations": state.get("total_iterations", 0) + 1,
+                "debug_trace": [
+                    f"[Analyst] Skipped non-SQL step {step.id} with tool '{step.tool}'"
+                ],
             }
 
     def synthesizer_node(self, state: AnalysisState):
@@ -181,25 +343,46 @@ class Orchestrator:
         return {"final_memo": memo}
 
     def should_continue(self, state: AnalysisState):
-        # Auto-Repair Cycle
-        if state.get('last_error'):
-             return "analyst"
+        """
+        Decide whether to keep running the analyst node or hand off to the synthesizer.
 
-        if state['current_step_index'] < len(state['plan']):
+        Important invariants:
+        - If we've exhausted the plan or hit max_steps, we must terminate, even if
+          there is a lingering last_error. This prevents infinite no-op loops.
+        - Auto-repair (retrying analyst) is only allowed while there are remaining
+          steps and we haven't exceeded the recursion_limit.
+        """
+
+        current_idx = state.get("current_step_index", 0)
+        plan_len = len(state.get("plan", []) or [])
+
+        # 1) Hard stops: plan exhausted or global max_steps reached.
+        if current_idx >= plan_len or current_idx >= self.config.max_steps:
+            return "synthesizer"
+
+        # 2) Auto-repair cycle while there are still steps left.
+        if state.get("last_error"):
+            if state.get("total_iterations", 0) >= self.config.recursion_limit:
+                # Stop auto-repair if we've exceeded recursion limit.
+                return "synthesizer"
             return "analyst"
-        return "synthesizer"
+
+        # 3) Normal forward progress through remaining steps.
+        return "analyst"
         
     async def run(self, query: str):
         """
         Main entry point to run the agent.
         """
-        initial_state = {
-            "user_query": query, 
+        initial_state: AnalysisState = {
+            "user_query": query,
             "step_results": [],
             "errors": [],
             "current_step_index": 0,
             "retry_count": 0,
             "last_error": None,
-            "context_data": {}
+            "context_data": {},
+            "total_iterations": 0,
+            "debug_trace": ["[Run] Starting analysis."],
         }
         return await self.graph.ainvoke(initial_state)
