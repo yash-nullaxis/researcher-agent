@@ -37,12 +37,24 @@ async def main():
     
     try:
         connector = SqlAlchemyConnector(connection_str=postgres_dsn)
-        # Test connection structure
+        
+        # Detailed connectivity check
+        print("Verifying connection and fetching schema...")
         info = connector.get_schema_info()
-        print(f"Connected! Schema Info Preview:\n{info[:500]}...")
+        
+        # Attempt to get precise table count
+        try:
+            schema_dict = connector.get_schema_dict()
+            table_count = len(schema_dict)
+            print(f"Connection Successful! Found {table_count} tables.")
+        except Exception:
+            print("Connection Successful! (Could not enumerate tables details)")
+
+        print(f"Schema Info Preview:\n{info[:500]}...")
     except Exception as e:
-        print(f"Failed to connect to Postgres: {e}")
+        print(f"CRITICAL ERROR: Failed to connect to Postgres: {e}")
         print("Ensure you have 'psycopg2-binary' installed: pip install psycopg2-binary")
+        print("Check your database URL and ensure the server is running.")
         return
 
     # 3. Initialize Agent
@@ -55,10 +67,16 @@ async def main():
     """
     
     print(f"\n--- Running Postgres Verification with Gemini 2.0 Flash ---\nQuery: {query}")
-    result = await agent.run(query)
-    
-    print("\n\n--- Final Memo ---")
-    print(result.get("final_memo", "No memo generated."))
+    try:
+        result = await agent.run(query)
+        
+        print("\n\n--- Final Memo ---")
+        print(result.get("final_memo", "No memo generated."))
+    except Exception as e:
+        print(f"\n[Error] Agent execution failed during analysis: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())

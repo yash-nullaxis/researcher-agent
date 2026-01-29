@@ -2,7 +2,6 @@ from typing import Dict, Optional
 
 from langgraph.graph import END, StateGraph
 
-from .analyst.classifier import QueryClassifier
 from .analyst.decomposer import QueryDecomposer
 from .analyst.executor import SQLExecutor
 from .analyst.relevance import RelevanceChecker
@@ -52,7 +51,6 @@ class Orchestrator:
             self.executor = SQLExecutor(default_conn)
 
         self.decomposer = QueryDecomposer(config)
-        self.classifier = QueryClassifier(config)
         self.sql_gen = SQLSynthesizer(config)
         self.validator = SQLValidator()
         # self.executor is already initialized in if/else block above
@@ -146,40 +144,13 @@ class Orchestrator:
         
         # Decompose
         datasource_list = list(self.connectors.keys())
-        
-        # Classify query complexity
-        if self.config.verbose:
-            print(f"[Planner] Classifying query complexity...")
-            
-        complexity = self.classifier.classify(state["user_query"])
-        
-        if not complexity.is_complex:
-            if self.config.verbose:
-                print(f"[Planner] Query classified as SIMPLE. Reason: {complexity.reasoning}")
-                print(f"[Planner] Skipping decomposition, creating direct SQL step.")
-            
-            steps = [
-                AnalysisStep(
-                    id=1,
-                    description=state["user_query"],
-                    tool="sql",
-                    datasource=self.default_source, # Use default source for simple queries
-                    dependency=-1,
-                    thought=f"Simple query detected ({complexity.reasoning}). Executing directly.",
-                )
-            ]
-        else:
-            if self.config.verbose:
-                print(f"[Planner] Query classified as COMPLEX. Reason: {complexity.reasoning}")
-                print(f"[Planner] Proceeding with decomposition.")
-                
-            steps = self.decomposer.decompose(
-                state["user_query"],
-                context=schema_summary,
-                datasources=self.config.datasource_hints or {
-                    name: "" for name in datasource_list
-                },
-            )
+        steps = self.decomposer.decompose(
+            state["user_query"],
+            context=schema_summary,
+            datasources=self.config.datasource_hints or {
+                name: "" for name in datasource_list
+            },
+        )
 
         if not steps:
             # Fallback to a single default SQL step so the agent remains usable.
