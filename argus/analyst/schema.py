@@ -1,8 +1,12 @@
+import logging
 from typing import Dict, Optional
 
 import uuid
 
 from ..db.connector import DBConnector
+
+
+logger = logging.getLogger(__name__)
 
 
 class SchemaInspector:
@@ -116,7 +120,7 @@ class SchemaInspector:
                 )
 
         except Exception as e:
-            print(f"Warning: Failed to index schemas for RAG: {e}")
+            logger.warning(f"Failed to index schemas for RAG: {e}")
 
     def _get_global_summary(self) -> str:
         """

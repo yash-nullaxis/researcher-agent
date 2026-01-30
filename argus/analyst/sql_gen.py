@@ -1,8 +1,11 @@
+import logging
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from ..config import AgentConfig
 from ..llm import get_llm
+
+logger = logging.getLogger(__name__)
 
 
 class SQLQuery(BaseModel):
@@ -93,5 +96,5 @@ class SQLSynthesizer:
             return result.get("query") or result.get("sql") or ""
         except Exception as e:
             # Fallback text parsing if JSON fails (Gemini sometimes returns markdown json)
-            print(f"SQL Gen Error: {e}")
+            logger.error(f"SQL Gen Error: {e}")
             return ""

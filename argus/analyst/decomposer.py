@@ -1,9 +1,13 @@
+import logging
 from typing import Dict, List
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 from ..llm import get_llm
 from ..config import AgentConfig
 from ..state import AnalysisStep
+
+logger = logging.getLogger(__name__)
+
 
 class AnalysisPlan(BaseModel):
     steps: List[AnalysisStep] = Field(description="List of analysis steps to perform")
@@ -90,5 +94,5 @@ class QueryDecomposer:
             return plan.steps
         except Exception as e:
             # Fallback or simple re-raise
-            print(f"Decomposition Error: {e}")
+            logger.error(f"Decomposition Error: {e}")
             return []

@@ -1,3 +1,4 @@
+import logging
 from typing import Dict, Optional
 
 from langgraph.graph import END, StateGraph
@@ -12,6 +13,9 @@ from .db.connector import DBConnector, DuckDBConnector, SqlAlchemyConnector
 from .safety import SQLValidator
 from .state import AnalysisState, AnalysisStep, StepResult
 from .synthesizer.memo import Synthesizer
+
+
+logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
@@ -121,7 +125,7 @@ class Orchestrator:
 
     def planner_node(self, state: AnalysisState):
         if self.config.verbose:
-            print("\n[Planner] Fetching Schema Summary...")
+            logger.info("[Planner] Fetching Schema Summary...")
             
         schema_summary = self.inspector.get_summary(query=state["user_query"])
         # Structured schema for validators / planner hints
@@ -140,7 +144,7 @@ class Orchestrator:
             schema_dict = {}
         
         if self.config.verbose:
-            print(f"[Planner] Schema Summary:\n{schema_summary}")
+            logger.info(f"[Planner] Schema Summary:\n{schema_summary}")
         
         # Decompose
         datasource_list = list(self.connectors.keys())
@@ -166,9 +170,9 @@ class Orchestrator:
             ]
         
         if self.config.verbose:
-            print(f"\n[Planner] Generated Plan: {len(steps)} steps")
+            logger.info(f"[Planner] Generated Plan: {len(steps)} steps")
             for s in steps:
-                print(f"  - [{s.id}] {s.description} (Source: {s.datasource})")
+                logger.info(f"  - [{s.id}] {s.description} (Source: {s.datasource})")
                 
         debug_msgs = [
             "[Planner] Completed planning.",
@@ -203,7 +207,7 @@ class Orchestrator:
                 "retry_count", 0
             ) >= self.config.max_retry_per_step:
                 if self.config.verbose:
-                    print(f"[Analyst] Max retries reached for step {step.id}")
+                    logger.warning(f"[Analyst] Max retries reached for step {step.id}")
                 return {
                     "step_results": [
                         StepResult(
@@ -222,8 +226,8 @@ class Orchestrator:
                 }
 
             if self.config.verbose:
-                print(
-                    f"\n[Analyst] Step ID: {step.id} (Attempt {state.get('retry_count', 0) + 1})"  # type: ignore[arg-type]
+                logger.info(
+                    f"[Analyst] Step ID: {step.id} (Attempt {state.get('retry_count', 0) + 1})"  # type: ignore[arg-type]
                 )
                 
             # Generate with Error Context if present
@@ -236,7 +240,7 @@ class Orchestrator:
             )
             
             if self.config.verbose:
-                print(f"[Analyst] Generated SQL: {query}")
+                logger.debug(f"[Analyst] Generated SQL: {query}")
 
             debug_msgs = [f"[Analyst] Step {step.id} SQL: {query}"]
 
@@ -258,7 +262,7 @@ class Orchestrator:
             )
             if not is_valid:
                 if self.config.verbose:
-                    print(f"[Analyst] Local validation failed: {error_msg}")
+                    logger.error(f"[Analyst] Local validation failed: {error_msg}")
                 debug_msgs.append(
                     f"[Analyst] Validation failed for step {step.id}: {error_msg}"
                 )
@@ -311,7 +315,7 @@ class Orchestrator:
                 }
             except Exception as e:
                 if self.config.verbose:
-                    print(f"[Analyst] Execution Error: {e}")
+                    logger.error(f"[Analyst] Execution Error: {e}")
                 return {
                     "last_error": str(e),
                     "retry_count": state.get("retry_count", 0) + 1,
