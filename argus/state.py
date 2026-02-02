@@ -35,18 +35,17 @@ class AnalysisState(TypedDict, total=False):
     # Core
     user_query: str
     plan: List[AnalysisStep]
-    current_step_index: int
     context_data: Dict[str, Any]  # Stores schema info, sample data, etc.
 
     # Outputs / accumulation
     step_results: Annotated[List[StepResult], operator.add]
     final_memo: str
-    errors: Annotated[List[str], operator.add]
-
-    # Control / retries
-    retry_count: int  # Tracking attempts for current step
-    last_error: Optional[str]  # Feedback for error correction
-    total_iterations: int  # Total analyst loop iterations across steps
-
+    
     # Debug / tracing
     debug_trace: Annotated[List[str], operator.add]
+
+# Input schema for the Analyst Node (for parallel execution)
+class AnalystInput(TypedDict):
+    step: AnalysisStep
+    user_query: str
+    context_data: Dict[str, Any]

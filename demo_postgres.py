@@ -2,11 +2,12 @@ import asyncio
 import os
 import argparse
 from dotenv import load_dotenv
+
+# Load .env to get GOOGLE_API_KEY and LangSmith config
+load_dotenv()
+
 from argus import Orchestrator, AgentConfig, ModelConfig, SqlAlchemyConnector
 from pydantic import SecretStr
-
-# Load .env to get GOOGLE_API_KEY
-load_dotenv()
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -68,10 +69,14 @@ async def main():
     
     print(f"\n--- Running Postgres Verification with Gemini 2.0 Flash ---\nQuery: {query}")
     try:
-        result = await agent.run(query)
-        
-        print("\n\n--- Final Memo ---")
-        print(result.get("final_memo", "No memo generated."))
+        print("\n\n--- Final Memo (Streaming) ---")
+        full_memo = ""
+        # Use stream_run to get tokens as they are generated
+        async for chunk in agent.stream_run(query):
+            print(chunk, end="", flush=True)
+            full_memo += chunk
+            
+        print("\n\n[Done]")
     except Exception as e:
         print(f"\n[Error] Agent execution failed during analysis: {e}")
         if args.verbose:

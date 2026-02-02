@@ -11,7 +11,7 @@ class Synthesizer:
         self.config = config
         self.llm = get_llm(config.model)
 
-    def synthesize(self, state: AnalysisState) -> str:
+    async def synthesize(self, state: AnalysisState) -> str:
         """
         Generates a final answer (Executive Memo) based on all step results.
         """
@@ -65,6 +65,6 @@ Format: Markdown.
         )
 
         chain = prompt | self.llm | StrOutputParser()
-        return chain.invoke(
+        return await chain.ainvoke(
             {"question": state["user_query"], "results": results_with_trace}
         )
